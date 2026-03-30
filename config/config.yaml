@@ -1,0 +1,89 @@
+models:
+  # Text encoder model (HuggingFace model identifier)
+  # Opções: 
+  #   - "Qwen/Qwen3-Embedding-0.6B" (1024 dim)
+  #   - "Qwen/Qwen3-Embedding-4B" (2560 dim)
+  #   - "intfloat/e5-mistral-7b-instruct" (4096 dim)
+  text_encoder: "Qwen/Qwen3-Embedding-0.6B"
+  
+  # Text encoder type (auto-detectado baseado no nome do modelo, mas pode ser especificado)
+  # Opções: "e5" ou "qwen3" (geralmente não necessário, é auto-detectado)
+  text_encoder_type: "qwen3"
+  
+  # Speech encoder model (HuggingFace model identifier)
+  speech_encoder: "facebook/hubert-large-ls960-ft"
+  
+  # Generator model for response generation
+  generator: "Qwen/Qwen-Audio-Chat"
+  
+training:
+  # Batch size conforme paper
+  batch_size: 4
+  
+  # Learning rate conforme paper
+  learning_rate: 5e-5
+  
+  # Número máximo de epochs (early stopping vai parar antes se necessário)
+  num_epochs: 20
+  
+  # Optimizer conforme paper
+  # Opções: "adam" ou "adamw"
+  optimizer: "adam"
+  
+  # Parâmetros beta do Adam conforme paper
+  beta1: 0.9
+  beta2: 0.999
+  
+  # Tipo de loss para treinamento
+  # Opções: "mse" (Mean Squared Error), "cosine" (Cosine Similarity Loss), "both" (combinação de ambos)
+  loss_type: "cosine"
+
+  # Finetuning settings
+  # Para replicar o paper, manter finetune_speech_encoder=true
+  finetune_speech_encoder: true
+  finetune_text_encoder: false
+  
+  weight_decay: 0.01
+  warmup_steps: 1000
+  scheduler: null  # Opções: "linear_warmup_cosine" ou "none"
+  use_amp: true
+
+  # Learning rates por módulo
+  speech_encoder_learning_rate: 5e-5
+  text_encoder_learning_rate: 5e-5
+  
+  # Gradient accumulation steps conforme paper
+  gradient_accumulation_steps: 16
+  
+  # Early stopping conforme paper (patience de 3)
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0  # Melhoria mínima para considerar como melhoria
+  
+  save_steps: 00
+  eval_steps: 500
+  logging_steps: 100
+  
+  # Frequência de logging por batch (1 = cada batch, 10 = a cada 10 batches, etc.)
+  log_batch_frequency: 1
+  
+generation:
+  model_name: "Qwen/Qwen-Audio-Chat"
+  temperature: 0.7
+  max_new_tokens: 512
+  top_p: 0.9
+  top_k_audio: 3
+  
+  # Se deve usar sampling (true) ou greedy decoding (false)
+  # Opções: true ou false
+  do_sample: true
+  
+  device: null
+  
+data:
+  dataset_name: "SpokenSQuAD"
+  sample_rate: 16000
+  max_audio_length: 60.0
+  
+paths:
+  data_dir: "/workspace/interspeech_2026/speech-rag/src/data"
+  output_dir: "/workspace/interspeech_2026/new-speech-rag/outputs/"
