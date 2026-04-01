@@ -5,8 +5,10 @@ import yaml
 import torch
 import json
 import os
+import re
+import string
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from tqdm import tqdm
 import sys
 
@@ -14,7 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models import TextEncoder, SpeechEncoder, SpeechAdapter
-from src.inference import SpeechRetriever
+from src.inference import SpeechRetriever, SpeechRAGPipeline, AudioConditionedGenerator
 
 
 def load_config(config_path: str) -> dict:
@@ -29,7 +31,7 @@ def load_ground_truth(metadata_path: str, audio_dir: str) -> Dict[str, Dict]:
     Carrega ground truth: mapeia query (question) -> audio_path correto
     
     Returns:
-        Dict: {query_id: {"query": question, "correct_audio": audio_path, "id": id}}
+        Dict: {query_id: {"query": question, "correct_audio": audio_path, "answers": [...]}}
     """
     print(f"Loading ground truth from {metadata_path}...")
     print(f"  Audio directory: {audio_dir}")
@@ -53,10 +55,25 @@ def load_ground_truth(metadata_path: str, audio_dir: str) -> Dict[str, Dict]:
                 if audio_path.exists():
                     # Normalizar path para comparação consistente
                     normalized_path = str(Path(audio_path).resolve())
+
+                    answers = []
+                    for answer_item in qa.get("answers", []):
+                        if isinstance(answer_item, dict):
+                            answer_text = str(answer_item.get("text", "")).strip()
+                            if answer_text:
+                                answers.append(answer_text)
+
+                    if not answers:
+                        # Fallback para datasets em que answer pode vir em outro campo.
+                        fallback_answer = str(qa.get("answer", "")).strip()
+                        if fallback_answer:
+                            answers.append(fallback_answer)
+
                     ground_truth[query_id] = {
                         "query": question,
                         "correct_audio": normalized_path,
-                        "id": query_id
+                        "id": query_id,
+                        "answers": answers,
                     }
                 else:
                     missing_files += 1
@@ -106,6 +123,115 @@ def calculate_mrr(retrieved_paths: List[str], correct_path: str) -> float:
         return 1.0 / rank
     except ValueError:
         return 0.0
+
+
+def normalize_answer(text: str) -> str:
+    """Normalize text for QA metrics (similar to SQuAD)."""
+    text = text.lower()
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = " ".join(text.split())
+    return text
+
+
+def exact_match_score(prediction: str, references: List[str]) -> float:
+    if not references:
+        return 0.0
+    pred_norm = normalize_answer(prediction)
+    return 1.0 if any(pred_norm == normalize_answer(ref) for ref in references) else 0.0
+
+
+def token_f1_score(prediction: str, references: List[str]) -> float:
+    if not references:
+        return 0.0
+
+    pred_tokens = normalize_answer(prediction).split()
+    if not pred_tokens:
+        return 0.0
+
+    best_f1 = 0.0
+    for ref in references:
+        ref_tokens = normalize_answer(ref).split()
+        if not ref_tokens:
+            continue
+
+        common = {}
+        for token in pred_tokens:
+            common[token] = min(pred_tokens.count(token), ref_tokens.count(token))
+        overlap = sum(common.values())
+
+        if overlap == 0:
+            f1 = 0.0
+        else:
+            precision = overlap / max(1, len(pred_tokens))
+            recall = overlap / max(1, len(ref_tokens))
+            f1 = 2 * precision * recall / (precision + recall)
+
+        if f1 > best_f1:
+            best_f1 = f1
+
+    return best_f1
+
+
+def evaluate_generation(
+    pipeline: SpeechRAGPipeline,
+    ground_truth: Dict[str, Dict],
+    top_k_audio: int,
+    temperature: float,
+    max_new_tokens: int,
+    top_p: float,
+    do_sample: bool,
+    max_samples: Optional[int] = None,
+) -> Dict:
+    """Evaluate end-to-end generation with QA metrics (Exact Match and Token F1)."""
+    samples_to_eval = list(ground_truth.items())
+    if max_samples:
+        samples_to_eval = samples_to_eval[:max_samples]
+
+    em_scores: List[float] = []
+    f1_scores: List[float] = []
+    predictions: List[Dict] = []
+
+    for query_id, gt in tqdm(samples_to_eval, desc="Generating"):
+        query = gt["query"]
+        answers = gt.get("answers", [])
+
+        rag_result = pipeline.retrieve_and_generate(
+            query=query,
+            k=top_k_audio,
+            return_retrieval_results=True,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            do_sample=do_sample,
+        )
+
+        prediction = rag_result["response"]
+        em = exact_match_score(prediction, answers)
+        f1 = token_f1_score(prediction, answers)
+
+        em_scores.append(em)
+        f1_scores.append(f1)
+
+        predictions.append(
+            {
+                "query_id": query_id,
+                "query": query,
+                "prediction": prediction,
+                "references": answers,
+                "em": em,
+                "token_f1": f1,
+                "audio_paths": rag_result.get("audio_paths", []),
+            }
+        )
+
+    count = len(samples_to_eval)
+    return {
+        "num_samples": count,
+        "exact_match": sum(em_scores) / max(1, count),
+        "token_f1": sum(f1_scores) / max(1, count),
+        "predictions": predictions,
+    }
 
 
 def evaluate_retrieval(
@@ -286,6 +412,46 @@ def main():
         help="Output file for results (JSON)"
     )
     parser.add_argument(
+        "--eval-generation",
+        action="store_true",
+        help="Evaluate end-to-end generation with Exact Match and Token F1"
+    )
+    parser.add_argument(
+        "--generation-max-samples",
+        type=int,
+        default=None,
+        help="Max samples for generation evaluation (None = use same as retrieval)"
+    )
+    parser.add_argument(
+        "--top-k-audio",
+        type=int,
+        default=None,
+        help="Top-K retrieved audios used for generation"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Generation temperature"
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Max new tokens for generation"
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p for generation sampling"
+    )
+    parser.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Enable sampling for generation"
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -400,8 +566,8 @@ def main():
         print("Error: No ground truth samples found. Check metadata and audio paths.")
         return
     
-    # Evaluate
-    results = evaluate_retrieval(
+    # Evaluate retrieval
+    retrieval_results = evaluate_retrieval(
         retriever=retriever,
         ground_truth=ground_truth,
         k_values=args.k,
@@ -410,19 +576,70 @@ def main():
     
     # Print results
     print("\n" + "="*60)
-    print("EVALUATION RESULTS")
+    print("RETRIEVAL EVALUATION RESULTS")
     print("="*60)
     for k in args.k:
-        print(f"Recall@{k}:     {results[f'recall@{k}']:.4f} ({results[f'top_{k}_accuracy']*100:.2f}% correct)")
-        print(f"Precision@{k}:  {results[f'precision@{k}']:.4f}")
-    print(f"MRR:            {results['mrr']:.4f}")
-    print(f"Total samples:  {results['num_samples']}")
+        print(f"Recall@{k}:     {retrieval_results[f'recall@{k}']:.4f} ({retrieval_results[f'top_{k}_accuracy']*100:.2f}% correct)")
+        print(f"Precision@{k}:  {retrieval_results[f'precision@{k}']:.4f}")
+    print(f"MRR:            {retrieval_results['mrr']:.4f}")
+    print(f"Total samples:  {retrieval_results['num_samples']}")
     print("="*60)
+
+    final_results = {
+        "retrieval": retrieval_results,
+    }
+
+    # Optional generation evaluation
+    if args.eval_generation:
+        print("\nInitializing generator for end-to-end evaluation...")
+        gen_config = config.get("generation", {})
+        top_k_audio = args.top_k_audio or int(gen_config.get("top_k_audio", 3))
+        temperature = args.temperature if args.temperature is not None else float(gen_config.get("temperature", 0.7))
+        max_new_tokens = args.max_new_tokens or int(gen_config.get("max_new_tokens", 256))
+        top_p = args.top_p if args.top_p is not None else float(gen_config.get("top_p", 0.9))
+        do_sample = args.do_sample or bool(gen_config.get("do_sample", False))
+        generation_max_samples = args.generation_max_samples
+
+        generator = AudioConditionedGenerator(
+            model_name=gen_config.get("model_name", config["models"].get("generator", "Qwen/Qwen-Audio-Chat")),
+            device=gen_config.get("device") or device,
+        )
+        pipeline = SpeechRAGPipeline(
+            retriever=retriever,
+            generator=generator,
+            top_k_audio=top_k_audio,
+        )
+
+        generation_results = evaluate_generation(
+            pipeline=pipeline,
+            ground_truth=ground_truth,
+            top_k_audio=top_k_audio,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            do_sample=do_sample,
+            max_samples=generation_max_samples,
+        )
+
+        print("\n" + "="*60)
+        print("GENERATION EVALUATION RESULTS")
+        print("="*60)
+        print(f"Exact Match:    {generation_results['exact_match']:.4f}")
+        print(f"Token F1:       {generation_results['token_f1']:.4f}")
+        print(f"Total samples:  {generation_results['num_samples']}")
+        print("="*60)
+
+        final_results["generation"] = {
+            "exact_match": generation_results["exact_match"],
+            "token_f1": generation_results["token_f1"],
+            "num_samples": generation_results["num_samples"],
+        }
+        final_results["generation_predictions"] = generation_results["predictions"]
     
     # Save results
     if args.output:
         with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(final_results, f, indent=2)
         print(f"\nResults saved to {args.output}")
 
 
